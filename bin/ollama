@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -e
+
+config_file="${XDG_CONFIG_HOME:-$HOME/.config}/ollama-adreno-termux/gpu.env"
+case "${1:-}" in
+  serve|start)
+    if [[ ! -r "$config_file" ]]; then
+      printf 'Missing configuration: %s\nRun install.sh again.\n' "$config_file" >&2
+      exit 1
+    fi
+    # shellcheck source=/dev/null
+    source "$config_file"
+    ;;
+esac
+
+ollama_prefix="${OLLAMA_TERMUX_PREFIX:-${PREFIX:-/data/data/com.termux/files/usr}}"
+# Keep argv[0] compatible with launchers that look for "ollama serve".
+exec -a ollama "$ollama_prefix/bin/ollama" "$@"

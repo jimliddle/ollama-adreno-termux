@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Inspect the local Vulkan runner and optionally verify GPU-backed generation."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+def request_json(path, payload=None):
+    data = None if payload is None else json.dumps(payload).encode()
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434" + path,
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    # Local checks must not travel through an inherited HTTP proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=240 if payload else 5) as response:
+        return json.load(response)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generate", metavar="MODEL", help="test an already installed model; does not pull models")
+    args = parser.parse_args()
+    prefix = Path(os.environ.get("OLLAMA_TERMUX_PREFIX") or os.environ.get("PREFIX") or "/data/data/com.termux/files/usr")
+    lib = prefix / "lib/ollama"
+    backend = lib / "vulkan/libggml-vulkan.so"
+    runner = lib / "llama-server"
+    print(f"Termux prefix: {prefix}")
+    print(f"Vulkan backend: {'installed' if backend.is_file() else 'MISSING'}")
+    loader = prefix / "lib/libvulkan.so"
+    print(f"Vulkan loader: {loader.resolve() if loader.exists() else 'MISSING'}")
+    if not backend.is_file() or not runner.is_file():
+        print("Install ollama, ollama-backend-vulkan, and vulkan-loader-android.", file=sys.stderr)
+        return 1
+
+    env = os.environ.copy()
+    env["LD_LIBRARY_PATH"] = ":".join(
+        [str(lib), str(lib / "vulkan"), str(prefix / "lib")]
+        + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else [])
+    )
+    env["GGML_BACKEND_PATH"] = str(backend)
+    result = subprocess.run([str(runner), "--list-devices"], env=env, capture_output=True, text=True, timeout=60)
+    output = result.stdout + result.stderr
+    print(output.strip())
+    if result.returncode or "Vulkan0:" not in output:
+        print("The runner did not enumerate a Vulkan GPU. See docs/troubleshooting.md.", file=sys.stderr)
+        return 1
+
+    print(f"Ollama version: {request_json('/api/version').get('version', 'unknown')}")
+    generated_model = None
+    if args.generate:
+        print(f"Testing {args.generate} at a 4096-token context...")
+        generation = request_json("/api/generate", {
+            "model": args.generate,
+            "prompt": "Reply with exactly: GPU test successful",
+            "stream": False,
+            "keep_alive": "5m",
+            "options": {"num_ctx": 4096, "num_predict": 24, "temperature": 0},
+        })
+        if not generation.get("done") or not generation.get("response", "").strip():
+            raise ValueError("Generation did not complete with a nonempty response")
+        generated_model = generation.get("model", args.generate)
+        print(f"Response: {generation['response'].strip()}")
+
+    models = request_json("/api/ps").get("models", [])
+    for model in models:
+        print(f"{model['name']}: GPU allocation {model.get('size_vram', 0):,} / {model.get('size', 0):,} bytes; context {model.get('context_length', 'unknown')}")
+    if generated_model:
+        loaded = next((m for m in models if m.get("name") == generated_model or m.get("model") == generated_model), None)
+        if not loaded or loaded.get("size_vram", 0) <= 0:
+            print("FAIL: generation completed, but GPU allocation was not confirmed.", file=sys.stderr)
+            return 1
+        print("PASS: generation completed and Ollama reports GPU allocation for that model.")
+        if loaded.get("size_vram") != loaded.get("size"):
+            print("The model is partially offloaded. Inspect ollama ps and the server log.")
+    elif not models:
+        print("No model is loaded. Device discovery alone does not prove GPU inference.")
+        print("Run ollama-gpu-check --generate MODEL_ALREADY_INSTALLED to verify inference.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.TimeoutExpired, urllib.error.URLError) as error:
+        print(f"Check failed: {error}", file=sys.stderr)
+        sys.exit(1)
